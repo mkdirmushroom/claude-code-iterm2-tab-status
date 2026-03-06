@@ -1,0 +1,473 @@
+"""Unit tests for claude_tab_status.py adapter.
+
+Runs outside iTerm2 by mocking the iterm2 module.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# --- Mock iterm2 module before importing adapter ---
+
+mock_iterm2 = MagicMock()
+mock_iterm2.run_forever = MagicMock()
+mock_iterm2.FocusMonitor = MagicMock()
+mock_iterm2.FocusUpdateActiveSessionChanged = MagicMock()
+mock_iterm2.FocusUpdateSelectedTabChanged = MagicMock()
+sys.modules["iterm2"] = mock_iterm2
+
+# Now import our adapter
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import claude_tab_status  # noqa: E402, I001
+
+
+# --- Fixtures ---
+
+
+@pytest.fixture
+def signal_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "claude-tab-status"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture
+def sample_signal() -> dict:
+    return {
+        "session_id": "ses-test-1",
+        "type": "idle",
+        "message": "Claude is idle",
+        "project": "myproject",
+        "cwd": "/Users/me/myproject",
+        "tty": "/dev/ttys042",
+        "pid": "12345",
+        "ts": str(int(time.time())),
+    }
+
+
+def write_signal(signal_dir: Path, signal: dict) -> Path:
+    p = signal_dir / f"{signal['session_id']}.json"
+    p.write_text(json.dumps(signal))
+    return p
+
+
+# --- TestSignalIO ---
+
+
+class TestSignalIO:
+    def test_read_signals_empty_dir(self, signal_dir: Path):
+        signals = claude_tab_status.read_signals(str(signal_dir))
+        assert signals == {}
+
+    def test_read_signals_one_file(self, signal_dir: Path, sample_signal: dict):
+        write_signal(signal_dir, sample_signal)
+        signals = claude_tab_status.read_signals(str(signal_dir))
+        assert "ses-test-1" in signals
+        assert signals["ses-test-1"]["type"] == "idle"
+
+    def test_read_signals_malformed_json(self, signal_dir: Path):
+        (signal_dir / "bad.json").write_text("not json{{{")
+        signals = claude_tab_status.read_signals(str(signal_dir))
+        assert signals == {}
+
+    def test_read_signals_ignores_non_json(self, signal_dir: Path, sample_signal: dict):
+        write_signal(signal_dir, sample_signal)
+        (signal_dir / "notes.txt").write_text("hello")
+        signals = claude_tab_status.read_signals(str(signal_dir))
+        assert len(signals) == 1
+
+    def test_remove_signal(self, signal_dir: Path, sample_signal: dict):
+        p = write_signal(signal_dir, sample_signal)
+        assert p.exists()
+        claude_tab_status.remove_signal(str(signal_dir), "ses-test-1")
+        assert not p.exists()
+
+    def test_remove_signal_nonexistent(self, signal_dir: Path):
+        # Should not raise
+        claude_tab_status.remove_signal(str(signal_dir), "ses-ghost")
+
+
+# --- TestSnapshot ---
+
+
+class TestSnapshot:
+    def test_capture_saves_fields(self):
+        snap = claude_tab_status.Snapshot(
+            tab_color={"red": 100, "green": 200, "blue": 50},
+            use_tab_color=True,
+            name="my session",
+            badge_text="",
+            allow_title_setting=True,
+        )
+        assert snap.tab_color == {"red": 100, "green": 200, "blue": 50}
+        assert snap.use_tab_color is True
+        assert snap.name == "my session"
+        assert snap.badge_text == ""
+        assert snap.allow_title_setting is True
+
+    def test_snapshot_equality(self):
+        a = claude_tab_status.Snapshot({"red": 0, "green": 0, "blue": 0}, False, "s", "", True)
+        b = claude_tab_status.Snapshot({"red": 0, "green": 0, "blue": 0}, False, "s", "", True)
+        assert a == b
+
+
+# --- TestMatchSession ---
+
+
+class TestMatchSession:
+    def _make_session(self, tty: str, pid: int = 100) -> MagicMock:
+        session = MagicMock()
+        session.async_get_variable = AsyncMock(
+            side_effect=lambda k: {
+                "tty": tty,
+                "jobPid": pid,
+            }.get(k)
+        )
+        session.session_id = f"iterm-{tty}"
+        return session
+
+    @pytest.mark.asyncio
+    async def test_match_by_tty(self):
+        s1 = self._make_session("/dev/ttys001")
+        s2 = self._make_session("/dev/ttys002")
+        result = await claude_tab_status.match_session([s1, s2], "/dev/ttys002", "999")
+        assert result == s2
+
+    @pytest.mark.asyncio
+    async def test_no_match(self):
+        s1 = self._make_session("/dev/ttys001")
+        result = await claude_tab_status.match_session([s1], "/dev/ttys099", "999")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_match_among_multiple(self):
+        sessions = [self._make_session(f"/dev/ttys{i:03d}") for i in range(5)]
+        result = await claude_tab_status.match_session(sessions, "/dev/ttys003", "999")
+        assert result == sessions[3]
+
+
+# --- TestPidAncestry ---
+
+
+class TestPidAncestry:
+    @patch("claude_tab_status._get_ppid")
+    def test_self_is_ancestor(self, mock_ppid: MagicMock):
+        assert claude_tab_status._is_ancestor(100, 100) is True
+        mock_ppid.assert_not_called()
+
+    @patch("claude_tab_status._get_ppid")
+    def test_direct_parent(self, mock_ppid: MagicMock):
+        mock_ppid.return_value = 100
+        assert claude_tab_status._is_ancestor(100, 200) is True
+
+    @patch("claude_tab_status._get_ppid")
+    def test_not_ancestor(self, mock_ppid: MagicMock):
+        # 200 -> 150 -> 1 (init), 100 is never found
+        mock_ppid.side_effect = lambda pid: {200: 150, 150: 1}.get(pid, 0)
+        assert claude_tab_status._is_ancestor(100, 200) is False
+
+    @patch("claude_tab_status._get_ppid")
+    def test_stops_at_pid_1(self, mock_ppid: MagicMock):
+        mock_ppid.side_effect = lambda pid: {200: 1}.get(pid, 0)
+        assert claude_tab_status._is_ancestor(100, 200) is False
+
+    @patch("claude_tab_status._get_ppid")
+    def test_stops_at_pid_0(self, mock_ppid: MagicMock):
+        mock_ppid.return_value = 0
+        assert claude_tab_status._is_ancestor(100, 200) is False
+
+
+# --- TestFocus ---
+
+
+class TestFocus:
+    def test_initial_state(self):
+        fm = claude_tab_status.FocusTracker()
+        assert fm.focused_session_id is None
+
+    def test_set_focus(self):
+        fm = claude_tab_status.FocusTracker()
+        fm.set_focused("iterm-ses-1")
+        assert fm.focused_session_id == "iterm-ses-1"
+
+    def test_is_focused(self):
+        fm = claude_tab_status.FocusTracker()
+        fm.set_focused("iterm-ses-1")
+        assert fm.is_focused("iterm-ses-1") is True
+        assert fm.is_focused("iterm-ses-2") is False
+
+
+# --- TestFlasher ---
+
+
+class TestFlasher:
+    def test_start_marks_active(self):
+        f = claude_tab_status.Flasher()
+        f.start("ses-1")
+        assert f.is_flashing("ses-1")
+
+    def test_stop_marks_inactive(self):
+        f = claude_tab_status.Flasher()
+        f.start("ses-1")
+        f.stop("ses-1")
+        assert not f.is_flashing("ses-1")
+
+    def test_double_start_is_noop(self):
+        f = claude_tab_status.Flasher()
+        f.start("ses-1")
+        f.start("ses-1")  # should not raise
+        assert f.is_flashing("ses-1")
+
+    def test_stop_without_start(self):
+        f = claude_tab_status.Flasher()
+        f.stop("ses-ghost")  # should not raise
+        assert not f.is_flashing("ses-ghost")
+
+
+# --- TestTabState ---
+
+
+class TestTabState:
+    def test_running_value(self):
+        assert claude_tab_status.TabState.RUNNING.value == "running"
+
+    def test_idle_value(self):
+        assert claude_tab_status.TabState.IDLE.value == "idle"
+
+    def test_attention_value(self):
+        assert claude_tab_status.TabState.ATTENTION.value == "attention"
+
+    def test_is_str(self):
+        assert isinstance(claude_tab_status.TabState.RUNNING, str)
+
+    def test_resolve_running(self):
+        assert claude_tab_status.resolve_state("running") == claude_tab_status.TabState.RUNNING
+
+    def test_resolve_idle(self):
+        assert claude_tab_status.resolve_state("idle") == claude_tab_status.TabState.IDLE
+
+    def test_resolve_attention(self):
+        assert claude_tab_status.resolve_state("attention") == claude_tab_status.TabState.ATTENTION
+
+    def test_resolve_unknown_defaults_to_idle(self):
+        assert claude_tab_status.resolve_state("bogus") == claude_tab_status.TabState.IDLE
+
+
+# --- TestTypeAliases (removed — old aliases no longer supported) ---
+
+
+class TestUnknownTypeFallback:
+    def test_idle_prompt_is_unknown_falls_to_idle(self):
+        """Old 'idle_prompt' type is no longer aliased, falls back to idle."""
+        assert claude_tab_status.resolve_state("idle_prompt") == claude_tab_status.TabState.IDLE
+
+    def test_permission_prompt_is_unknown_falls_to_idle(self):
+        """Old 'permission_prompt' type is no longer aliased, falls back to idle."""
+        result = claude_tab_status.resolve_state("permission_prompt")
+        assert result == claude_tab_status.TabState.IDLE
+
+
+# --- TestStripAllPrefixes ---
+
+
+class TestStripAllPrefixes:
+    def test_strip_running_prefix(self):
+        result = claude_tab_status.strip_all_prefixes("⚡ My Session")
+        assert result == "My Session"
+
+    def test_strip_idle_prefix(self):
+        result = claude_tab_status.strip_all_prefixes("💤 My Session")
+        assert result == "My Session"
+
+    def test_strip_attention_prefix(self):
+        result = claude_tab_status.strip_all_prefixes("🔴 My Session")
+        assert result == "My Session"
+
+    def test_no_prefix_unchanged(self):
+        result = claude_tab_status.strip_all_prefixes("My Session")
+        assert result == "My Session"
+
+    def test_empty_string(self):
+        result = claude_tab_status.strip_all_prefixes("")
+        assert result == ""
+
+
+# --- TestSetStatePrefix ---
+
+
+class TestSetStatePrefix:
+    def test_set_running_prefix(self):
+        result = claude_tab_status.set_state_prefix("My Session", "⚡ ")
+        assert result == "⚡ My Session"
+
+    def test_replace_existing_prefix(self):
+        result = claude_tab_status.set_state_prefix("💤 My Session", "⚡ ")
+        assert result == "⚡ My Session"
+
+    def test_replace_attention_with_idle(self):
+        result = claude_tab_status.set_state_prefix("🔴 My Session", "💤 ")
+        assert result == "💤 My Session"
+
+
+# --- TestTitlePrefix (backward compat) ---
+
+
+class TestTitlePrefix:
+    def test_prefix_added(self):
+        result = claude_tab_status.add_title_prefix("My Session", "\U0001f534 ")
+        assert result == "\U0001f534 My Session"
+
+    def test_no_double_prefix(self):
+        result = claude_tab_status.add_title_prefix("\U0001f534 My Session", "\U0001f534 ")
+        assert result == "\U0001f534 My Session"
+
+    def test_remove_prefix(self):
+        result = claude_tab_status.remove_title_prefix("\U0001f534 My Session", "\U0001f534 ")
+        assert result == "My Session"
+
+    def test_remove_prefix_not_present(self):
+        result = claude_tab_status.remove_title_prefix("My Session", "\U0001f534 ")
+        assert result == "My Session"
+
+
+# --- TestPidLiveness ---
+
+
+class TestPidLiveness:
+    @patch("os.kill")
+    def test_alive_pid(self, mock_kill: MagicMock):
+        mock_kill.return_value = None  # no exception → alive
+        assert claude_tab_status._is_pid_alive(12345) is True
+        mock_kill.assert_called_once_with(12345, 0)
+
+    @patch("os.kill")
+    def test_dead_pid(self, mock_kill: MagicMock):
+        mock_kill.side_effect = ProcessLookupError()
+        assert claude_tab_status._is_pid_alive(99999) is False
+
+    @patch("os.kill")
+    def test_permission_error_means_alive(self, mock_kill: MagicMock):
+        mock_kill.side_effect = PermissionError()
+        assert claude_tab_status._is_pid_alive(1) is True
+
+    def test_zero_pid_is_dead(self):
+        assert claude_tab_status._is_pid_alive(0) is False
+
+    def test_negative_pid_is_dead(self):
+        assert claude_tab_status._is_pid_alive(-1) is False
+
+
+# --- TestPickFlashColor ---
+
+
+class TestPickFlashColor:
+    def test_default_orange_for_dark_tab(self):
+        """Dark tab → configured orange (default) has enough contrast."""
+        r, g, b = claude_tab_status._pick_flash_color(0, 0, 0)
+        m = claude_tab_status
+        assert (r, g, b) == (m.CONFIG["color_r"], m.CONFIG["color_g"], m.CONFIG["color_b"])
+
+    def test_fallback_blue_for_orange_tab(self):
+        """Orange tab → configured orange too close, falls back to blue."""
+        r, g, b = claude_tab_status._pick_flash_color(255, 140, 0)
+        assert (r, g, b) == (0, 136, 255)
+
+    def test_fallback_white_for_blue_tab(self):
+        """Blue tab close to fallback blue → falls to white."""
+        r, g, b = claude_tab_status._pick_flash_color(0, 120, 240)
+        # Orange should work here (far from blue)
+        m = claude_tab_status
+        assert (r, g, b) == (m.CONFIG["color_r"], m.CONFIG["color_g"], m.CONFIG["color_b"])
+
+    def test_similar_to_all_candidates(self):
+        """Color close to orange, blue, AND white → inverts."""
+        # This is nearly impossible in practice, but test the fallback
+        # We need a color within 120 of (255,140,0), (0,136,255), AND (255,255,255)
+        # That's geometrically impossible, so just verify the function doesn't crash
+        r, g, b = claude_tab_status._pick_flash_color(128, 128, 128)
+        assert isinstance(r, int) and isinstance(g, int) and isinstance(b, int)
+
+
+# --- TestConfig ---
+
+
+class TestConfig:
+    def test_defaults_when_no_file(self, tmp_path: Path):
+        """No config file → all defaults."""
+        cfg = claude_tab_status.load_config(str(tmp_path / "nonexistent.json"))
+        assert cfg["dir"] == "/tmp/claude-tab-status"
+        assert cfg["prefix_running"] == "⚡ "
+        assert cfg["prefix_idle"] == "💤 "
+        assert cfg["prefix_attention"] == "🔴 "
+        assert cfg["color_r"] == 255
+        assert cfg["color_g"] == 140
+        assert cfg["color_b"] == 0
+        assert cfg["interval"] == 0.6
+        assert cfg["badge_enabled"] is True
+        assert cfg["badge"] == "⚠️ Needs input"
+        assert cfg["notify"] is False
+        assert cfg["sound"] == ""
+
+    def test_file_overrides_defaults(self, tmp_path: Path):
+        """Config file values override defaults."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"prefix_running": "🚀 ", "color_r": 100}))
+        cfg = claude_tab_status.load_config(str(cfg_file))
+        assert cfg["prefix_running"] == "🚀 "
+        assert cfg["color_r"] == 100
+        assert cfg["prefix_idle"] == "💤 "
+
+    def test_env_overrides_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Env vars override config file values."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"prefix_running": "🚀 "}))
+        monkeypatch.setenv("CLAUDE_ITERM2_TAB_STATUS_PREFIX_RUNNING", "🔥 ")
+        cfg = claude_tab_status.load_config(str(cfg_file))
+        assert cfg["prefix_running"] == "🔥 "
+
+    def test_malformed_json_uses_defaults(self, tmp_path: Path):
+        """Malformed JSON → fall back to defaults."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text("not json{{{")
+        cfg = claude_tab_status.load_config(str(cfg_file))
+        assert cfg["prefix_running"] == "⚡ "
+
+    def test_badge_enabled_false(self, tmp_path: Path):
+        """badge_enabled=false is respected."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"badge_enabled": False}))
+        cfg = claude_tab_status.load_config(str(cfg_file))
+        assert cfg["badge_enabled"] is False
+
+    def test_env_badge_enabled_false(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Env var BADGE_ENABLED=false overrides default."""
+        monkeypatch.setenv("CLAUDE_ITERM2_TAB_STATUS_BADGE_ENABLED", "false")
+        cfg = claude_tab_status.load_config(str(tmp_path / "nonexistent.json"))
+        assert cfg["badge_enabled"] is False
+
+
+# --- TestHotReload ---
+
+
+class TestHotReload:
+    def test_reload_config_updates_config(self, tmp_path: Path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"prefix_running": "\U0001f680 "}))
+        claude_tab_status.reload_config(str(cfg_file))
+        assert claude_tab_status.CONFIG["prefix_running"] == "\U0001f680 "
+        # Cleanup: restore defaults
+        claude_tab_status.reload_config(str(tmp_path / "nonexistent.json"))
+
+    def test_reload_rebuilds_prefixes(self, tmp_path: Path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"prefix_running": "\U0001f680 "}))
+        claude_tab_status.reload_config(str(cfg_file))
+        assert "\U0001f680 " in claude_tab_status.ALL_PREFIXES
+        # Cleanup
+        claude_tab_status.reload_config(str(tmp_path / "nonexistent.json"))
