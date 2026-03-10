@@ -81,8 +81,10 @@ S_PROJ="$(escape_json "$PROJECT")"
 S_CWD="$(escape_json "$CWD")"
 S_TTY="$(escape_json "$TTY")"
 
-# Write signal file
-cat > "${STATUS_DIR}/${SESSION_ID}.json" <<SIGNAL
+# Write signal file atomically (write to temp, then mv)
+# Prevents the adapter from reading a partially-written file.
+TMPFILE="$(mktemp "${STATUS_DIR}/.tmp.XXXXXX")"
+cat > "$TMPFILE" <<SIGNAL
 {
   "session_id": "${S_SID}",
   "type": "${S_TYPE}",
@@ -94,3 +96,4 @@ cat > "${STATUS_DIR}/${SESSION_ID}.json" <<SIGNAL
   "ts": "${TS}"
 }
 SIGNAL
+mv "$TMPFILE" "${STATUS_DIR}/${SESSION_ID}.json"
